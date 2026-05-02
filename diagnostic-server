@@ -1,0 +1,101 @@
+sudo bash -c '
+echo "===== INFO SISTEMA ====="
+hostnamectl
+echo
+
+echo "===== KERNEL ====="
+uname -a
+echo
+
+echo "===== CPU ====="
+lscpu | grep "Model name"
+echo
+
+echo "===== RAM ====="
+free -h
+echo
+
+echo "===== DISCOS ====="
+lsblk
+echo
+
+echo "===== BIOS ====="
+dmidecode -t bios | grep -E "Vendor|Version|Release Date"
+echo
+
+echo "===== TARGET ACTIVO ====="
+systemctl get-default
+echo
+
+echo "===== DISPLAY MANAGER ====="
+systemctl status display-manager 2>/dev/null | head -n 5
+echo
+
+echo "===== GDM ====="
+systemctl status gdm 2>/dev/null | head -n 5
+echo
+
+echo "===== LOGIND CONFIG ====="
+grep -v "^#" /etc/systemd/logind.conf 2>/dev/null
+echo
+
+echo "===== TARGETS SUSPEND ====="
+systemctl status sleep.target suspend.target hibernate.target hybrid-sleep.target
+echo
+
+echo "===== POWER PROFILES ====="
+systemctl status power-profiles-daemon 2>/dev/null | head -n 5
+echo
+
+echo "===== ACPI ====="
+systemctl status acpid 2>/dev/null | head -n 5
+echo
+
+echo "===== TIMERS SOSPECHOSOS ====="
+systemctl list-timers --all | grep -Ei "sleep|suspend|power|idle"
+echo
+
+echo "===== SERVICIOS RUNNING ====="
+systemctl list-units --type=service --state=running | head -n 25
+echo
+
+echo "===== NETWORK ====="
+nmcli dev status
+echo
+
+echo "===== IP ====="
+ip a | grep inet
+echo
+
+echo "===== TAILSCALE ====="
+tailscale status 2>/dev/null
+echo
+
+echo "===== TELEMETRIA UBUNTU ====="
+dpkg -l | grep -E "whoopsie|apport|ubuntu-report|popularity-contest"
+echo
+
+echo "===== SNAP ====="
+which snap 2>/dev/null
+echo
+
+echo "===== FLATPAK ====="
+which flatpak 2>/dev/null
+echo
+
+echo "===== BLUETOOTH ====="
+systemctl status bluetooth 2>/dev/null | head -n 5
+echo
+
+echo "===== CUPS ====="
+systemctl status cups 2>/dev/null | head -n 5
+echo
+
+echo "===== AVAHI ====="
+systemctl status avahi-daemon 2>/dev/null | head -n 5
+echo
+
+echo "===== ULTIMOS EVENTOS SUSPEND ====="
+journalctl -n 50 | grep -Ei "suspend|sleep|hibernate|gdm"
+echo
+'
