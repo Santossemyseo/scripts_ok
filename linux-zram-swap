@@ -1,0 +1,121 @@
+sudo bash -c '
+set -e
+
+LOG="/var/log/zram-swap-setup.log"
+exec > >(tee -a "$LOG") 2>&1
+
+echo "===== INICIO CONFIGURACION ZRAM + SWAP ====="
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Debe ejecutarse como root"
+  exit 1
+fi
+
+echo
+echo "Detectando RAM..."
+RAM_MB=$(free -m | awk "/Mem:/ {print \$2}")
+echo "RAM detectada: ${RAM_MB} MB"
+
+echo
+echo "Calculando tamaños optimos..."
+ZRAM_MB=$((RAM_MB/2))
+SWAP_MB=$RAM_MB
+
+echo "ZRAM objetivo: ${ZRAM_MB} MB"
+echo "SWAP objetivo: ${SWAP_MB} MB"
+
+echo
+echo "Instalando zram-tools..."
+apt update -qq
+apt install -y zram-tools
+
+echo
+echo "Configurando ZRAM..."
+sed -i "s/^#*ALGO=.*/ALGO=zstd/" /etc/default/zramswap
+sed -i "s/^#*PERCENT=.*/PERCENT=50/" /etc/default/zramswap
+
+systemctl enable zramswap
+systemctl restart zramswap
+
+echo
+echo "Asignando prioridad alta a ZRAM..."
+swapoff /dev/zram0 2>/dev/null || true
+swapon -p 100 /dev/zram0 2>/dev/null || true
+
+echo
+echo "Verificando swap existente..."
+CURRENT_SWAP=$(swapon --show=SIZE --bytes | awk "{sum+=\$1} END {printf \"%d\", sum/1024/1024}")
+
+echo "Swap actual: ${CURRENT_SWAP} MB"
+
+if [ "$CURRENT_SWAP" -lt "$SWAP_MB" ]; then
+
+  echo
+  echo "Validando espacio disponible en disco..."
+
+  FREE_DISK=$(df -m / | awk "NR==2 {print \$4}")
+
+  if [ "$FREE_DISK" -lt "$SWAP_MB" ]; then
+    echo "ERROR: No hay espacio suficiente para crear swapfile"
+    exit 1
+  fi
+
+  if [ ! -f /swapfile ]; then
+
+    echo
+    echo "Creando swapfile..."
+
+    fallocate -l ${SWAP_MB}M /swapfile
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon -p 10 /swapfile
+
+    grep -q "/swapfile" /etc/fstab || \
+    echo "/swapfile none swap sw 0 0" >> /etc/fstab
+
+  fi
+fi
+
+echo
+echo "Configurando swappiness..."
+
+if grep -q "^vm.swappiness" /etc/sysctl.conf; then
+  sed -i "s/^vm.swappiness=.*/vm.swappiness=10/" /etc/sysctl.conf
+else
+  echo "vm.swappiness=10" >> /etc/sysctl.conf
+fi
+
+echo "vm.dirty_ratio=10" >> /etc/sysctl.conf
+echo "vm.dirty_background_ratio=5" >> /etc/sysctl.conf
+
+sysctl -p >/dev/null
+
+echo
+echo "Calculando memoria efectiva equivalente..."
+
+ZRAM_EFFECTIVE=$((ZRAM_MB*2))
+SWAP_EFFECTIVE=$((SWAP_MB/4))
+RAM_EFFECTIVE=$((RAM_MB+ZRAM_EFFECTIVE+SWAP_EFFECTIVE))
+
+echo
+echo "===== RESUMEN FINAL ====="
+echo "RAM fisica:        ${RAM_MB} MB"
+echo "ZRAM configurado:  ${ZRAM_MB} MB"
+echo "Swap configurado:  ${SWAP_MB} MB"
+echo "RAM equivalente:   ${RAM_EFFECTIVE} MB (~$((RAM_EFFECTIVE/1024)) GB)"
+
+echo
+echo "Estado actual swap:"
+swapon --show
+
+echo
+echo "Estado memoria:"
+free -h
+
+echo
+echo "Log guardado en: $LOG"
+
+echo
+echo "Configuracion completada correctamente"
+
+'
