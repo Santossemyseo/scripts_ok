@@ -1,16 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
-LOG="${LOG:-/var/log/auto-mem-tune.log}"
+SCRIPT_NAME="auto-mem-tune"
+ACTION="apply"
+YES=0
+ZRAM_PERCENT_OVERRIDE=""
+SWAP_PERCENT_OVERRIDE=""
+ZRAM_ALGO_FORCE_OVERRIDE=""
 
-log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+if [[ "${EUID:-$(id -u)}" -eq 0 && -w /var/log ]]; then
+  LOG_DEFAULT="/var/log/${SCRIPT_NAME}.log"
+else
+  LOG_DEFAULT="${HOME:-/tmp}/${SCRIPT_NAME}.log"
+fi
 
-need_root() {
+LOG="${LOG:-$LOG_DEFAULT}"
+mkdir -p "$(dirname "$LOG")"
+exec > >(tee -a "$LOG") 2>&1
+
+TS="$(date +%Y%m%d-%H%M%S)"
+BACKUP_DIR="${BACKUP_DIR:-${HOME:-/tmp}/.${SCRIPT_NAME}-backups}"
+
+BOOT_HELPER="/usr/local/sbin/${SCRIPT_NAME}-zram.sh"
+BOOT_UNIT="/etc/systemd/system/${SCRIPT_NAME}-zram.service"
+SYSCTL_FILE="/etc/sysctl.d/99-${SCRIPT_NAME}.conf"
+CONFIG_FILE="/etc/default/zram-tune"
+SWAPFILE="/swapfile"
+
+log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+ok(){ log "[OK] $*"; }
+info(){ log "[INFO] $*"; }
+warn(){ log "[WARN] $*"; }
+die(){ log "[FAIL] $*"; exit 1; }
+
+require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    echo "Ejecuta esto como root/sudo."
-    exit 1
+    die "Ejecuta como root/sudo para esta acción."
   fi
 }
+
+is_linux() { [[ "$(uname -s)" == "Linux" ]]; }
+is_wsl() { grep -qi microsoft /proc/version 2>/dev/null || uname -r | grep -qi microsoft; }
 
 in_container() {
   [[ -f /.dockerenv ]] && return 0
@@ -18,167 +49,158 @@ in_container() {
   return 1
 }
 
-configure_linux_host() {
-  need_root
-  if in_container; then
-    echo "Esto detecta un contenedor. Para cambiar memoria/swap del host, ejecútalo en el host, no dentro del contenedor."
-    exit 1
+ensure_zram_module() {
+
+  if modprobe zram 2>/dev/null; then
+    ok "Módulo zram cargado"
+    return 0
   fi
 
-  if ! command -v apt-get >/dev/null 2>&1; then
-    echo "Este perfil está pensado para Debian/Ubuntu/Mint basados en apt."
-    exit 1
+  warn "Intentando instalar soporte kernel zram..."
+
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -qq
+    apt-get install -y linux-modules-extra-$(uname -r) || true
   fi
 
-  RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
-  ZRAM_MB=$((RAM_MB / 2))
-  SWAP_MB=$((RAM_MB))
-  if [[ "$ZRAM_MB" -lt 256 ]]; then ZRAM_MB=256; fi
-  if [[ "$SWAP_MB" -lt 512 ]]; then SWAP_MB=512; fi
+  modprobe zram 2>/dev/null || die "El kernel no soporta zram"
+}
 
-  ZRAM_ALGO="lz4"
-  if [[ "$RAM_MB" -ge 4096 ]]; then
-    ZRAM_ALGO="zstd"
-  fi
+write_linux_config() {
 
-  log "RAM detectada: ${RAM_MB} MB"
-  log "ZRAM objetivo: ${ZRAM_MB} MB"
-  log "Swap objetivo: ${SWAP_MB} MB"
-
-  apt-get update -qq
-  apt-get install -y zram-tools
-
-  cat >/etc/default/zramswap <<EOF
-ALGO=${ZRAM_ALGO}
-PERCENT=50
+cat >"$CONFIG_FILE" <<EOF
+ZRAM_PERCENT=50
+SWAP_PERCENT=100
+ZRAM_ALGO_FORCE=
 EOF
 
-  systemctl enable zramswap
-  systemctl restart zramswap || true
+chmod 0644 "$CONFIG_FILE"
 
-  swapon -p 100 /dev/zram0 2>/dev/null || true
+ok "Config persistente creada"
+}
 
-  FREE_DISK_MB=$(df -Pm / | awk 'NR==2 {print $4}')
-  if (( FREE_DISK_MB < SWAP_MB )); then
-    echo "No hay suficiente espacio en disco para crear /swapfile (${FREE_DISK_MB} MB libres)."
-    exit 1
-  fi
+write_helper() {
 
-  CURRENT_SWAPFILE_MB=0
-  if [[ -f /swapfile ]]; then
-    CURRENT_SWAPFILE_MB=$(( $(stat -c%s /swapfile) / 1024 / 1024 ))
-  fi
+cat >"$BOOT_HELPER" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
 
-  if (( CURRENT_SWAPFILE_MB < SWAP_MB )); then
-    swapoff /swapfile 2>/dev/null || true
-    rm -f /swapfile
-    if command -v fallocate >/dev/null 2>&1; then
-      fallocate -l "${SWAP_MB}M" /swapfile
-    else
-      dd if=/dev/zero of=/swapfile bs=1M count="${SWAP_MB}" status=none
-    fi
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon -p 10 /swapfile
-  fi
+CONFIG_FILE="/etc/default/zram-tune"
 
-  if ! grep -qE '^\s*/swapfile\s' /etc/fstab; then
-    echo "/swapfile none swap sw,pri=10 0 0" >> /etc/fstab
-  fi
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
-  cat >/etc/sysctl.d/99-mem-tune.conf <<EOF
+RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
+
+ZRAM_PERCENT="${ZRAM_PERCENT:-50}"
+ZRAM_MB=$((RAM_MB * ZRAM_PERCENT / 100))
+
+[[ "$ZRAM_MB" -lt 256 ]] && ZRAM_MB=256
+
+if swapon --show | grep -q zram; then
+echo "zram ya activo — no se recrea"
+exit 0
+fi
+
+modprobe zram
+
+DEV=$(zramctl -f --size ${ZRAM_MB}M)
+
+mkswap "$DEV"
+swapon -p 100 "$DEV"
+
+echo "zram activo en $DEV"
+EOF
+
+chmod 0755 "$BOOT_HELPER"
+
+ok "Helper creado"
+}
+
+write_unit() {
+
+cat >"$BOOT_UNIT" <<EOF
+[Unit]
+Description=Auto memory tune zram setup
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=$BOOT_HELPER
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable auto-mem-tune-zram.service
+
+ok "Servicio systemd instalado"
+}
+
+configure_swap() {
+
+RAM=$(free -m | awk '/Mem:/ {print $2}')
+SWAP=$RAM
+
+if [[ ! -f "$SWAPFILE" ]]; then
+fallocate -l ${SWAP}M "$SWAPFILE"
+chmod 600 "$SWAPFILE"
+mkswap "$SWAPFILE"
+fi
+
+swapon -p 10 "$SWAPFILE"
+
+grep -q swapfile /etc/fstab || \
+echo "/swapfile none swap sw 0 0" >> /etc/fstab
+
+ok "Swapfile configurado"
+}
+
+configure_linux() {
+
+require_root
+
+if in_container; then
+die "Ejecutar en host, no contenedor"
+fi
+
+ensure_zram_module
+
+write_linux_config
+write_helper
+write_unit
+
+"$BOOT_HELPER"
+
+configure_swap
+
+cat >/etc/sysctl.d/99-auto-mem-tune.conf <<EOF
 vm.swappiness=10
+vm.vfs_cache_pressure=50
 vm.dirty_ratio=10
 vm.dirty_background_ratio=5
 EOF
 
-  sysctl --system >/dev/null
+sysctl --system >/dev/null
 
-  EFFECTIVE_MB=$((RAM_MB + (ZRAM_MB * 2) + (SWAP_MB / 4)))
-
-  echo
-  echo "===== RESUMEN LINUX ====="
-  echo "RAM física:                ${RAM_MB} MB"
-  echo "ZRAM configurado:          ${ZRAM_MB} MB"
-  echo "Swap en disco configurado: ${SWAP_MB} MB"
-  echo "RAM efectiva aproximada:   ${EFFECTIVE_MB} MB (~$((EFFECTIVE_MB / 1024)) GB)"
-  echo
-  swapon --show
-  free -h
-}
-
-configure_wsl2() {
-  need_root
-  echo "Detectado WSL2."
-
-  if ! command -v powershell.exe >/dev/null 2>&1; then
-    echo "No encuentro powershell.exe para leer el RAM del host Windows."
-    exit 1
-  fi
-
-  WIN_RAM_BYTES=$(powershell.exe -NoProfile -Command "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory" | tr -d '\r')
-  WIN_RAM_GB=$(( (WIN_RAM_BYTES + 1024*1024*1024 - 1) / (1024*1024*1024) ))
-  if (( WIN_RAM_GB < 1 )); then WIN_RAM_GB=1; fi
-
-  WSL_MEM_GB=$(( WIN_RAM_GB / 2 ))
-  WSL_SWAP_GB=$(( WIN_RAM_GB / 4 ))
-  if (( WSL_MEM_GB < 1 )); then WSL_MEM_GB=1; fi
-  if (( WSL_SWAP_GB < 1 )); then WSL_SWAP_GB=1; fi
-
-  WIN_PROFILE=$(powershell.exe -NoProfile -Command "[Environment]::GetFolderPath('UserProfile')" | tr -d '\r')
-  WIN_PROFILE_LINUX=$(wslpath "$WIN_PROFILE")
-
-  cat > "${WIN_PROFILE_LINUX}/.wslconfig" <<EOF
-[wsl2]
-memory=${WSL_MEM_GB}GB
-swap=${WSL_SWAP_GB}GB
-EOF
-
-  echo
-  echo "===== RESUMEN WSL2 ====="
-  echo "RAM Windows detectada:  ${WIN_RAM_GB} GB"
-  echo ".wslconfig creado en:   ${WIN_PROFILE_LINUX}/.wslconfig"
-  echo "memory=${WSL_MEM_GB}GB"
-  echo "swap=${WSL_SWAP_GB}GB"
-  echo
-  echo "Para aplicar, cierra WSL y ejecuta desde Windows: wsl --shutdown"
-}
-
-configure_macos() {
-  need_root
-  echo "Detectado macOS."
-
-  echo "Memoria física:"
-  sysctl -n hw.memsize
-
-  echo
-  echo "Ajustando energía para modo servidor..."
-  pmset -a sleep 0 displaysleep 0 disksleep 0 powernap 0 standby 0 autopoweroff 0 ttyskeepawake 1
-
-  echo
-  echo "macOS gestiona compresión de memoria y swap automáticamente; aquí solo se deja el equipo listo para quedarse despierto como servidor."
-  echo
-  pmset -g
+echo
+echo "===== RESUMEN FINAL ====="
+swapon --show
+zramctl
+free -h
+echo "Configuración finalizada correctamente"
 }
 
 main() {
-  OS="$(uname -s)"
-  case "$OS" in
-    Linux)
-      if grep -qi microsoft /proc/version 2>/dev/null || uname -r | grep -qi microsoft; then
-        configure_wsl2
-      else
-        configure_linux_host
-      fi
-      ;;
-    Darwin)
-      configure_macos
-      ;;
-    *)
-      echo "Sistema no soportado por este launcher: $OS"
-      exit 1
-      ;;
-  esac
+
+if is_linux; then
+configure_linux
+else
+die "Sistema no soportado"
+fi
+
+echo
+echo "[OK] Script ejecutado correctamente"
 }
 
 main "$@"
