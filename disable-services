@@ -1,0 +1,61 @@
+sudo bash -c '
+echo "=== CAMBIANDO A MODO SERVER ==="
+systemctl set-default multi-user.target
+
+echo "=== DESACTIVANDO GUI ==="
+systemctl disable lightdm 2>/dev/null
+systemctl disable gdm 2>/dev/null
+systemctl mask lightdm 2>/dev/null
+systemctl mask gdm 2>/dev/null
+
+echo "=== DESACTIVANDO SUSPEND ==="
+systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+
+echo "=== DESACTIVANDO SERVICIOS INNECESARIOS ==="
+systemctl disable bluetooth 2>/dev/null
+systemctl disable cups 2>/dev/null
+systemctl disable cups-browsed 2>/dev/null
+systemctl disable avahi-daemon 2>/dev/null
+systemctl disable ModemManager 2>/dev/null
+systemctl disable colord 2>/dev/null
+systemctl disable kerneloops 2>/dev/null
+systemctl disable packagekit 2>/dev/null
+systemctl disable power-profiles-daemon 2>/dev/null
+
+echo "=== DETENIENDO SERVICIOS ==="
+systemctl stop bluetooth 2>/dev/null
+systemctl stop cups 2>/dev/null
+systemctl stop cups-browsed 2>/dev/null
+systemctl stop avahi-daemon 2>/dev/null
+systemctl stop ModemManager 2>/dev/null
+systemctl stop colord 2>/dev/null
+systemctl stop kerneloops 2>/dev/null
+systemctl stop packagekit 2>/dev/null
+systemctl stop power-profiles-daemon 2>/dev/null
+
+echo "=== ELIMINANDO TELEMETRIA UBUNTU/MINT ==="
+apt purge -y apport whoopsie popularity-contest ubuntu-report 2>/dev/null
+
+echo "=== ELIMINANDO FLATPAK ==="
+apt purge -y flatpak 2>/dev/null
+
+echo "=== OPTIMIZANDO LOGS ==="
+sed -i "s/#Storage=.*/Storage=volatile/" /etc/systemd/journald.conf
+systemctl restart systemd-journald
+
+echo "=== OPTIMIZANDO SWAP ==="
+echo "vm.swappiness=10" >> /etc/sysctl.conf
+sysctl -p
+
+echo "=== LIMPIANDO PAQUETES ==="
+apt autoremove -y
+apt clean
+
+echo "=== ACTUALIZANDO SISTEMA ==="
+apt update && apt upgrade -y
+
+echo "=== ESTADO FINAL ==="
+systemctl get-default
+free -h
+systemctl list-units --type=service --state=running | head -n 20
+'
