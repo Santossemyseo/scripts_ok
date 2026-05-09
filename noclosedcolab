@@ -1,11 +1,21 @@
-function ClickConnect() {
-var iconElement = document.getElementById("toggle-header-button");
-if (iconElement) {
-var clickEvent = new MouseEvent ("click", {
-bubbles: true, cancelable: true,
-view: window
-});
-iconElement.dispatchEvent (clickEvent);
-}
-}
-setInterval(ClickConnect, 600000);
+// Mantiene visible/activa una sesión de Google Colab alternando el panel de conexión cada 10 minutos.
+(function keepColabOpen() {
+  'use strict';
+
+  function clickConnect() {
+    const iconElement = document.getElementById('toggle-header-button');
+    if (!iconElement) {
+      console.warn('[noclosedcolab] No se encontró #toggle-header-button.');
+      return;
+    }
+
+    iconElement.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }));
+  }
+
+  clickConnect();
+  window.setInterval(clickConnect, 600000);
+}());
