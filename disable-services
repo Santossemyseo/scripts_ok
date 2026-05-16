@@ -1,61 +1,143 @@
-sudo bash -c '
-echo "=== CAMBIANDO A MODO SERVER ==="
-systemctl set-default multi-user.target
+#!/usr/bin/env bash
+# Convierte un Linux con systemd en perfil servidor: desactiva GUI/suspensión/servicios no esenciales y limpia paquetes opcionales.
+set -euo pipefail
 
-echo "=== DESACTIVANDO GUI ==="
-systemctl disable lightdm 2>/dev/null
-systemctl disable gdm 2>/dev/null
-systemctl mask lightdm 2>/dev/null
-systemctl mask gdm 2>/dev/null
+NO_UPGRADE="${NO_UPGRADE:-0}"
+REMOVE_FLATPAK="${REMOVE_FLATPAK:-1}"
+SERVICES=(bluetooth cups cups-browsed avahi-daemon ModemManager colord kerneloops packagekit power-profiles-daemon)
+DISPLAY_MANAGERS=(lightdm gdm gdm3 sddm)
+SUSPEND_TARGETS=(sleep.target suspend.target hibernate.target hybrid-sleep.target)
 
-echo "=== DESACTIVANDO SUSPEND ==="
-systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+warn() { log "WARN: $*"; }
+die() { log "ERROR: $*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
-echo "=== DESACTIVANDO SERVICIOS INNECESARIOS ==="
-systemctl disable bluetooth 2>/dev/null
-systemctl disable cups 2>/dev/null
-systemctl disable cups-browsed 2>/dev/null
-systemctl disable avahi-daemon 2>/dev/null
-systemctl disable ModemManager 2>/dev/null
-systemctl disable colord 2>/dev/null
-systemctl disable kerneloops 2>/dev/null
-systemctl disable packagekit 2>/dev/null
-systemctl disable power-profiles-daemon 2>/dev/null
+require_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Ejecuta este script con sudo/root."
+  [[ "$(uname -s)" == "Linux" ]] || die "Este script solo soporta Linux."
+  have systemctl || die "systemd no está disponible."
+}
 
-echo "=== DETENIENDO SERVICIOS ==="
-systemctl stop bluetooth 2>/dev/null
-systemctl stop cups 2>/dev/null
-systemctl stop cups-browsed 2>/dev/null
-systemctl stop avahi-daemon 2>/dev/null
-systemctl stop ModemManager 2>/dev/null
-systemctl stop colord 2>/dev/null
-systemctl stop kerneloops 2>/dev/null
-systemctl stop packagekit 2>/dev/null
-systemctl stop power-profiles-daemon 2>/dev/null
+unit_exists() {
+  systemctl list-unit-files "$1" --no-legend 2>/dev/null | awk '{print $1}' | grep -qx "$1"
+}
 
-echo "=== ELIMINANDO TELEMETRIA UBUNTU/MINT ==="
-apt purge -y apport whoopsie popularity-contest ubuntu-report 2>/dev/null
+disable_and_stop() {
+  local unit="$1"
+  if unit_exists "$unit.service"; then
+    systemctl disable "$unit" 2>/dev/null || warn "No se pudo deshabilitar $unit."
+    systemctl stop "$unit" 2>/dev/null || true
+  else
+    warn "Servicio $unit no existe; se omite."
+  fi
+}
 
-echo "=== ELIMINANDO FLATPAK ==="
-apt purge -y flatpak 2>/dev/null
+mask_unit() {
+  local unit="$1"
+  if systemctl list-unit-files "$unit" --no-legend >/dev/null 2>&1; then
+    systemctl mask "$unit" 2>/dev/null || warn "No se pudo enmascarar $unit."
+  fi
+}
 
-echo "=== OPTIMIZANDO LOGS ==="
-sed -i "s/#Storage=.*/Storage=volatile/" /etc/systemd/journald.conf
-systemctl restart systemd-journald
+purge_if_apt() {
+  have apt-get || { warn "apt-get no está disponible; se omite limpieza de paquetes."; return 0; }
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get purge -y "$@" 2>/dev/null || true
+}
 
-echo "=== OPTIMIZANDO SWAP ==="
-echo "vm.swappiness=10" >> /etc/sysctl.conf
-sysctl -p
+configure_server_target() {
+  log "Cambiando target por defecto a multi-user.target."
+  systemctl set-default multi-user.target
+}
 
-echo "=== LIMPIANDO PAQUETES ==="
-apt autoremove -y
-apt clean
+disable_gui() {
+  log "Desactivando gestores gráficos conocidos."
+  for manager in "${DISPLAY_MANAGERS[@]}"; do
+    disable_and_stop "$manager"
+    mask_unit "$manager.service"
+  done
+}
 
-echo "=== ACTUALIZANDO SISTEMA ==="
-apt update && apt upgrade -y
+disable_suspend() {
+  log "Desactivando suspensión/hibernación."
+  for target in "${SUSPEND_TARGETS[@]}"; do
+    mask_unit "$target"
+  done
+}
 
-echo "=== ESTADO FINAL ==="
-systemctl get-default
-free -h
-systemctl list-units --type=service --state=running | head -n 20
-'
+disable_optional_services() {
+  log "Desactivando servicios no esenciales para servidor."
+  for service in "${SERVICES[@]}"; do
+    disable_and_stop "$service"
+  done
+}
+
+remove_optional_packages() {
+  log "Eliminando telemetría Ubuntu/Mint si existe."
+  purge_if_apt apport whoopsie popularity-contest ubuntu-report
+
+  if [[ "$REMOVE_FLATPAK" == "1" ]]; then
+    log "Eliminando flatpak si existe."
+    purge_if_apt flatpak
+  else
+    warn "REMOVE_FLATPAK=0; flatpak se conserva."
+  fi
+}
+
+optimize_logs() {
+  log "Configurando journald con almacenamiento volátil."
+  mkdir -p /etc/systemd/journald.conf.d
+  cat > /etc/systemd/journald.conf.d/99-server-profile.conf <<'EOF_JOURNALD'
+[Journal]
+Storage=volatile
+EOF_JOURNALD
+  systemctl restart systemd-journald
+}
+
+optimize_swap() {
+  log "Configurando swappiness=10."
+  cat > /etc/sysctl.d/99-server-profile.conf <<'EOF_SYSCTL'
+vm.swappiness=10
+EOF_SYSCTL
+  sysctl --system >/dev/null
+}
+
+cleanup_packages() {
+  have apt-get || return 0
+  log "Limpiando paquetes apt."
+  apt-get autoremove -y
+  apt-get clean
+
+  if [[ "$NO_UPGRADE" == "1" ]]; then
+    warn "NO_UPGRADE=1; se omite apt upgrade."
+  else
+    log "Actualizando sistema con apt-get upgrade."
+    apt-get update
+    apt-get upgrade -y
+  fi
+}
+
+show_final_state() {
+  echo
+  echo "===== ESTADO FINAL ====="
+  systemctl get-default
+  free -h
+  systemctl list-units --type=service --state=running --no-pager | head -n 25
+}
+
+main() {
+  require_root
+  configure_server_target
+  disable_gui
+  disable_suspend
+  disable_optional_services
+  remove_optional_packages
+  optimize_logs
+  optimize_swap
+  cleanup_packages
+  show_final_state
+  log "Perfil servidor aplicado correctamente. Reinicia para completar el cambio de target."
+}
+
+main "$@"

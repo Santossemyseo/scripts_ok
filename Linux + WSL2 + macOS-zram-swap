@@ -1,206 +1,218 @@
 #!/usr/bin/env bash
+# Detecta Linux, WSL2 o macOS y aplica/explica la estrategia segura de memoria disponible para cada plataforma.
 set -euo pipefail
-umask 022
 
 SCRIPT_NAME="auto-mem-tune"
-ACTION="apply"
-YES=0
-ZRAM_PERCENT_OVERRIDE=""
-SWAP_PERCENT_OVERRIDE=""
-ZRAM_ALGO_FORCE_OVERRIDE=""
-
-if [[ "${EUID:-$(id -u)}" -eq 0 && -w /var/log ]]; then
-  LOG_DEFAULT="/var/log/${SCRIPT_NAME}.log"
-else
-  LOG_DEFAULT="${HOME:-/tmp}/${SCRIPT_NAME}.log"
-fi
-
-LOG="${LOG:-$LOG_DEFAULT}"
-mkdir -p "$(dirname "$LOG")"
-exec > >(tee -a "$LOG") 2>&1
-
-TS="$(date +%Y%m%d-%H%M%S)"
-BACKUP_DIR="${BACKUP_DIR:-${HOME:-/tmp}/.${SCRIPT_NAME}-backups}"
-
-BOOT_HELPER="/usr/local/sbin/${SCRIPT_NAME}-zram.sh"
-BOOT_UNIT="/etc/systemd/system/${SCRIPT_NAME}-zram.service"
+ACTION="${1:-apply}"
+LOG="${LOG:-${HOME:-/tmp}/${SCRIPT_NAME}.log}"
+ZRAM_PERCENT="${ZRAM_PERCENT:-50}"
+SWAP_PERCENT="${SWAP_PERCENT:-100}"
+SWAPPINESS="${SWAPPINESS:-10}"
+SWAPFILE="${SWAPFILE:-/swapfile}"
 SYSCTL_FILE="/etc/sysctl.d/99-${SCRIPT_NAME}.conf"
 CONFIG_FILE="/etc/default/zram-tune"
-SWAPFILE="/swapfile"
+BOOT_HELPER="/usr/local/sbin/${SCRIPT_NAME}-zram.sh"
+BOOT_UNIT="/etc/systemd/system/${SCRIPT_NAME}-zram.service"
 
-log(){ printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
-ok(){ log "[OK] $*"; }
-info(){ log "[INFO] $*"; }
-warn(){ log "[WARN] $*"; }
-die(){ log "[FAIL] $*"; exit 1; }
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+warn() { log "WARN: $*"; }
+die() { log "ERROR: $*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+  cat <<'EOF_USAGE'
+Uso: sudo ./Linux\ +\ WSL2\ +\ macOS-zram-swap [apply|status|help]
+
+apply   Aplica zram + swapfile en Linux nativo con systemd.
+status  Muestra memoria/swap y recomendaciones en Linux, WSL2 o macOS.
+help    Muestra esta ayuda.
+
+Variables opcionales: ZRAM_PERCENT=50 SWAP_PERCENT=100 SWAPPINESS=10 SWAPFILE=/swapfile
+EOF_USAGE
+}
+
+init_log() {
+  mkdir -p "$(dirname "$LOG")"
+  touch "$LOG"
+  exec > >(tee -a "$LOG") 2>&1
+}
 
 require_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    die "Ejecuta como root/sudo para esta acción."
-  fi
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Ejecuta con sudo/root para aplicar cambios."
 }
 
 is_linux() { [[ "$(uname -s)" == "Linux" ]]; }
-is_wsl() { grep -qi microsoft /proc/version 2>/dev/null || uname -r | grep -qi microsoft; }
+is_macos() { [[ "$(uname -s)" == "Darwin" ]]; }
+is_wsl() { grep -qiE '(microsoft|wsl)' /proc/version 2>/dev/null || uname -r | grep -qiE '(microsoft|wsl)'; }
+in_container() { [[ -f /.dockerenv ]] || grep -qaE '(docker|containerd|kubepods|podman)' /proc/1/cgroup 2>/dev/null; }
 
-in_container() {
-  [[ -f /.dockerenv ]] && return 0
-  grep -qaE '(docker|containerd|kubepods|podman)' /proc/1/cgroup 2>/dev/null && return 0
-  return 1
+linux_status() {
+  echo "===== MEMORIA LINUX ====="
+  free -h
+  echo
+  echo "===== SWAP ====="
+  swapon --show || true
+  echo
+  echo "===== ZRAM ====="
+  zramctl 2>/dev/null || echo "zramctl no disponible o zram no activo."
+}
+
+wsl_status() {
+  linux_status
+  cat <<'EOF_WSL'
+
+===== RECOMENDACIÓN WSL2 =====
+WSL2 administra memoria y swap principalmente desde Windows con %UserProfile%\.wslconfig.
+Este script no fuerza zram dentro de WSL2 porque depende del kernel/configuración de la distribución.
+Ejemplo en Windows:
+[wsl2]
+memory=8GB
+swap=8GB
+localhostForwarding=true
+EOF_WSL
+}
+
+macos_status() {
+  echo "===== MEMORIA macOS ====="
+  vm_stat || true
+  echo
+  sysctl hw.memsize vm.swapusage 2>/dev/null || true
+  cat <<'EOF_MAC'
+
+===== RECOMENDACIÓN macOS =====
+macOS gestiona compresión de memoria y swap automáticamente. No existe zram nativo equivalente.
+Este script solo informa estado en macOS para evitar cambios inseguros.
+EOF_MAC
 }
 
 ensure_zram_module() {
-
   if modprobe zram 2>/dev/null; then
-    ok "Módulo zram cargado"
     return 0
   fi
 
-  warn "Intentando instalar soporte kernel zram..."
-
-  if command -v apt-get >/dev/null 2>&1; then
+  if have apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y linux-modules-extra-$(uname -r) || true
+    apt-get install -y "linux-modules-extra-$(uname -r)" || true
   fi
 
-  modprobe zram 2>/dev/null || die "El kernel no soporta zram"
+  modprobe zram 2>/dev/null || die "El kernel no soporta zram o el módulo no está disponible."
 }
 
-write_linux_config() {
-
-cat >"$CONFIG_FILE" <<EOF
-ZRAM_PERCENT=50
-SWAP_PERCENT=100
-ZRAM_ALGO_FORCE=
-EOF
-
-chmod 0644 "$CONFIG_FILE"
-
-ok "Config persistente creada"
+write_config() {
+  cat > "$CONFIG_FILE" <<EOF_CONFIG
+ZRAM_PERCENT=${ZRAM_PERCENT}
+SWAP_PERCENT=${SWAP_PERCENT}
+EOF_CONFIG
+  chmod 0644 "$CONFIG_FILE"
 }
 
 write_helper() {
-
-cat >"$BOOT_HELPER" <<'EOF'
+  cat > "$BOOT_HELPER" <<'EOF_HELPER'
 #!/usr/bin/env bash
+# Activa un dispositivo zram persistente para auto-mem-tune durante el arranque.
 set -euo pipefail
 
 CONFIG_FILE="/etc/default/zram-tune"
-
 [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
-
-RAM_MB=$(free -m | awk '/Mem:/ {print $2}')
-
 ZRAM_PERCENT="${ZRAM_PERCENT:-50}"
+RAM_MB="$(free -m | awk '/Mem:/ {print $2}')"
 ZRAM_MB=$((RAM_MB * ZRAM_PERCENT / 100))
-
 [[ "$ZRAM_MB" -lt 256 ]] && ZRAM_MB=256
 
-if swapon --show | grep -q zram; then
-echo "zram ya activo — no se recrea"
-exit 0
+if swapon --show=NAME | grep -qE '^/dev/zram'; then
+  echo "zram ya activo; no se recrea."
+  exit 0
 fi
 
 modprobe zram
-
-DEV=$(zramctl -f --size ${ZRAM_MB}M)
-
+DEV="$(zramctl -f --size "${ZRAM_MB}M")"
 mkswap "$DEV"
 swapon -p 100 "$DEV"
-
-echo "zram activo en $DEV"
-EOF
-
-chmod 0755 "$BOOT_HELPER"
-
-ok "Helper creado"
+echo "zram activo en $DEV (${ZRAM_MB} MB)."
+EOF_HELPER
+  chmod 0755 "$BOOT_HELPER"
 }
 
 write_unit() {
-
-cat >"$BOOT_UNIT" <<EOF
+  cat > "$BOOT_UNIT" <<EOF_UNIT
 [Unit]
 Description=Auto memory tune zram setup
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=$BOOT_HELPER
+ExecStart=${BOOT_HELPER}
+RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable auto-mem-tune-zram.service
-
-ok "Servicio systemd instalado"
+EOF_UNIT
+  systemctl daemon-reload
+  systemctl enable "$(basename "$BOOT_UNIT")" >/dev/null
 }
 
-configure_swap() {
+configure_swapfile() {
+  local ram_mb swap_mb free_disk_mb
+  ram_mb="$(free -m | awk '/Mem:/ {print $2}')"
+  swap_mb=$((ram_mb * SWAP_PERCENT / 100))
+  [[ "$swap_mb" -lt 512 ]] && swap_mb=512
 
-RAM=$(free -m | awk '/Mem:/ {print $2}')
-SWAP=$RAM
+  if [[ ! -f "$SWAPFILE" ]]; then
+    free_disk_mb="$(df -Pm "$(dirname "$SWAPFILE")" | awk 'NR==2 {print $4}')"
+    [[ "$free_disk_mb" -gt "$swap_mb" ]] || die "Espacio insuficiente para crear ${SWAPFILE}."
+    fallocate -l "${swap_mb}M" "$SWAPFILE" || dd if=/dev/zero of="$SWAPFILE" bs=1M count="$swap_mb" status=progress
+    chmod 600 "$SWAPFILE"
+    mkswap "$SWAPFILE"
+  fi
 
-if [[ ! -f "$SWAPFILE" ]]; then
-fallocate -l ${SWAP}M "$SWAPFILE"
-chmod 600 "$SWAPFILE"
-mkswap "$SWAPFILE"
-fi
-
-swapon -p 10 "$SWAPFILE"
-
-grep -q swapfile /etc/fstab || \
-echo "/swapfile none swap sw 0 0" >> /etc/fstab
-
-ok "Swapfile configurado"
+  swapon --show=NAME | grep -qx "$SWAPFILE" || swapon -p 10 "$SWAPFILE"
+  awk -v sf="$SWAPFILE" '$1 == sf {found=1} END {exit !found}' /etc/fstab || printf '%s none swap sw 0 0\n' "$SWAPFILE" >> /etc/fstab
 }
 
-configure_linux() {
-
-require_root
-
-if in_container; then
-die "Ejecutar en host, no contenedor"
-fi
-
-ensure_zram_module
-
-write_linux_config
-write_helper
-write_unit
-
-"$BOOT_HELPER"
-
-configure_swap
-
-cat >/etc/sysctl.d/99-auto-mem-tune.conf <<EOF
-vm.swappiness=10
+configure_sysctl() {
+  cat > "$SYSCTL_FILE" <<EOF_SYSCTL
+vm.swappiness=${SWAPPINESS}
 vm.vfs_cache_pressure=50
 vm.dirty_ratio=10
 vm.dirty_background_ratio=5
-EOF
+EOF_SYSCTL
+  sysctl --system >/dev/null
+}
 
-sysctl --system >/dev/null
-
-echo
-echo "===== RESUMEN FINAL ====="
-swapon --show
-zramctl
-free -h
-echo "Configuración finalizada correctamente"
+apply_linux() {
+  require_root
+  have systemctl || die "systemd no está disponible. En WSL2 usa status y configura .wslconfig desde Windows."
+  in_container && die "Ejecuta en el host, no dentro de un contenedor."
+  ensure_zram_module
+  write_config
+  write_helper
+  write_unit
+  "$BOOT_HELPER"
+  configure_swapfile
+  configure_sysctl
+  linux_status
+  log "Configuración Linux aplicada correctamente."
 }
 
 main() {
+  [[ "$ACTION" == "help" || "$ACTION" == "--help" || "$ACTION" == "-h" ]] && { usage; exit 0; }
+  init_log
 
-if is_linux; then
-configure_linux
-else
-die "Sistema no soportado"
-fi
-
-echo
-echo "[OK] Script ejecutado correctamente"
+  case "$ACTION" in
+    status)
+      if is_macos; then macos_status; elif is_wsl; then wsl_status; elif is_linux; then linux_status; else die "Sistema no soportado."; fi
+      ;;
+    apply)
+      if is_macos; then macos_status; die "macOS no soporta zram nativo; no se aplican cambios."; fi
+      if is_wsl; then wsl_status; die "WSL2 debe ajustarse con .wslconfig; no se aplican cambios Linux nativos."; fi
+      is_linux && apply_linux || die "Sistema no soportado."
+      ;;
+    *)
+      usage
+      die "Acción inválida: $ACTION"
+      ;;
+  esac
 }
 
 main "$@"

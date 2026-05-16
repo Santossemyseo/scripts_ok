@@ -1,121 +1,146 @@
-sudo bash -c '
-set -e
+#!/usr/bin/env bash
+# Configura zram y un swapfile persistente en Linux con systemd para mejorar el manejo de memoria.
+set -euo pipefail
 
-LOG="/var/log/zram-swap-setup.log"
-exec > >(tee -a "$LOG") 2>&1
+SCRIPT_NAME="linux-zram-swap"
+LOG="${LOG:-/var/log/${SCRIPT_NAME}.log}"
+ZRAM_PERCENT="${ZRAM_PERCENT:-50}"
+SWAP_PERCENT="${SWAP_PERCENT:-100}"
+SWAPPINESS="${SWAPPINESS:-10}"
+ZRAM_ALGO="${ZRAM_ALGO:-zstd}"
+SWAPFILE="${SWAPFILE:-/swapfile}"
+SYSCTL_FILE="/etc/sysctl.d/99-${SCRIPT_NAME}.conf"
 
-echo "===== INICIO CONFIGURACION ZRAM + SWAP ====="
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+warn() { log "WARN: $*"; }
+die() { log "ERROR: $*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Debe ejecutarse como root"
-  exit 1
-fi
+require_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Ejecuta este script con sudo/root."
+}
 
-echo
-echo "Detectando RAM..."
-RAM_MB=$(free -m | awk "/Mem:/ {print \$2}")
-echo "RAM detectada: ${RAM_MB} MB"
+require_linux_systemd() {
+  [[ "$(uname -s)" == "Linux" ]] || die "Este script solo soporta Linux."
+  have systemctl || die "systemd no está disponible; usa el script multi-plataforma para diagnóstico."
+}
 
-echo
-echo "Calculando tamaños optimos..."
-ZRAM_MB=$((RAM_MB/2))
-SWAP_MB=$RAM_MB
+init_log() {
+  mkdir -p "$(dirname "$LOG")"
+  touch "$LOG"
+  chmod 0644 "$LOG"
+  exec > >(tee -a "$LOG") 2>&1
+}
 
-echo "ZRAM objetivo: ${ZRAM_MB} MB"
-echo "SWAP objetivo: ${SWAP_MB} MB"
+install_zram_tools() {
+  if have apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y zram-tools
+  elif ! have zramctl; then
+    die "No se encontró zramctl y no hay apt-get para instalar zram-tools."
+  fi
+}
 
-echo
-echo "Instalando zram-tools..."
-apt update -qq
-apt install -y zram-tools
+configure_zramswap_defaults() {
+  local default_file="/etc/default/zramswap"
+  [[ -f "$default_file" ]] || touch "$default_file"
 
-echo
-echo "Configurando ZRAM..."
-sed -i "s/^#*ALGO=.*/ALGO=zstd/" /etc/default/zramswap
-sed -i "s/^#*PERCENT=.*/PERCENT=50/" /etc/default/zramswap
+  if grep -qE '^#?ALGO=' "$default_file"; then
+    sed -i "s/^#*ALGO=.*/ALGO=${ZRAM_ALGO}/" "$default_file"
+  else
+    printf 'ALGO=%s\n' "$ZRAM_ALGO" >> "$default_file"
+  fi
 
-systemctl enable zramswap
-systemctl restart zramswap
+  if grep -qE '^#?PERCENT=' "$default_file"; then
+    sed -i "s/^#*PERCENT=.*/PERCENT=${ZRAM_PERCENT}/" "$default_file"
+  else
+    printf 'PERCENT=%s\n' "$ZRAM_PERCENT" >> "$default_file"
+  fi
+}
 
-echo
-echo "Asignando prioridad alta a ZRAM..."
-swapoff /dev/zram0 2>/dev/null || true
-swapon -p 100 /dev/zram0 2>/dev/null || true
+start_zramswap() {
+  systemctl enable zramswap >/dev/null
+  systemctl restart zramswap
 
-echo
-echo "Verificando swap existente..."
-CURRENT_SWAP=$(swapon --show=SIZE --bytes | awk "{sum+=\$1} END {printf \"%d\", sum/1024/1024}")
+  if swapon --show=NAME | grep -qE '^/dev/zram'; then
+    local zram_dev
+    zram_dev="$(swapon --show=NAME | awk '/zram/ {print $1; exit}')"
+    swapoff "$zram_dev" 2>/dev/null || true
+    swapon -p 100 "$zram_dev" 2>/dev/null || warn "No se pudo ajustar prioridad de $zram_dev."
+  fi
+}
 
-echo "Swap actual: ${CURRENT_SWAP} MB"
+configure_swapfile() {
+  local ram_mb swap_mb current_swap_mb free_disk_mb
+  ram_mb="$(free -m | awk '/Mem:/ {print $2}')"
+  swap_mb=$((ram_mb * SWAP_PERCENT / 100))
+  [[ "$swap_mb" -lt 512 ]] && swap_mb=512
 
-if [ "$CURRENT_SWAP" -lt "$SWAP_MB" ]; then
+  current_swap_mb="$(swapon --show=SIZE --bytes | awk '{sum+=$1} END {printf "%d", sum/1024/1024}')"
+  log "Swap actual: ${current_swap_mb} MB; objetivo mínimo: ${swap_mb} MB."
+
+  if [[ "$current_swap_mb" -ge "$swap_mb" && -f "$SWAPFILE" ]]; then
+    log "El swap existente cumple el objetivo; no se recrea $SWAPFILE."
+  else
+    free_disk_mb="$(df -Pm "$(dirname "$SWAPFILE")" | awk 'NR==2 {print $4}')"
+    [[ "$free_disk_mb" -gt "$swap_mb" ]] || die "Espacio insuficiente para crear ${SWAPFILE} (${swap_mb} MB requeridos)."
+
+    if [[ ! -f "$SWAPFILE" ]]; then
+      log "Creando $SWAPFILE de ${swap_mb} MB."
+      fallocate -l "${swap_mb}M" "$SWAPFILE" || dd if=/dev/zero of="$SWAPFILE" bs=1M count="$swap_mb" status=progress
+      chmod 600 "$SWAPFILE"
+      mkswap "$SWAPFILE"
+    fi
+  fi
+
+  swapon --show=NAME | grep -qx "$SWAPFILE" || swapon -p 10 "$SWAPFILE"
+  awk -v sf="$SWAPFILE" '$1 == sf {found=1} END {exit !found}' /etc/fstab || printf '%s none swap sw 0 0\n' "$SWAPFILE" >> /etc/fstab
+}
+
+configure_sysctl() {
+  cat > "$SYSCTL_FILE" <<EOF_SYSCTL
+vm.swappiness=${SWAPPINESS}
+vm.vfs_cache_pressure=50
+vm.dirty_ratio=10
+vm.dirty_background_ratio=5
+EOF_SYSCTL
+  sysctl --system >/dev/null
+}
+
+summary() {
+  local ram_mb zram_mb swap_mb effective_mb
+  ram_mb="$(free -m | awk '/Mem:/ {print $2}')"
+  zram_mb="$(zramctl --bytes --noheadings 2>/dev/null | awk '{sum+=$3} END {printf "%d", sum/1024/1024}')"
+  swap_mb="$(swapon --show=SIZE --bytes | awk '{sum+=$1} END {printf "%d", sum/1024/1024}')"
+  effective_mb=$((ram_mb + (zram_mb * 2) + (swap_mb / 4)))
 
   echo
-  echo "Validando espacio disponible en disco..."
+  echo "===== RESUMEN FINAL ====="
+  printf 'RAM física:        %s MB\n' "$ram_mb"
+  printf 'ZRAM configurado:  %s MB\n' "${zram_mb:-0}"
+  printf 'Swap total:        %s MB\n' "${swap_mb:-0}"
+  printf 'RAM equivalente:   %s MB (~%s GB)\n' "$effective_mb" "$((effective_mb / 1024))"
+  echo
+  swapon --show
+  zramctl || true
+  free -h
+  echo
+  log "Log guardado en: $LOG"
+}
 
-  FREE_DISK=$(df -m / | awk "NR==2 {print \$4}")
+main() {
+  require_root
+  require_linux_systemd
+  init_log
+  log "===== INICIO CONFIGURACIÓN ZRAM + SWAP ====="
+  install_zram_tools
+  configure_zramswap_defaults
+  start_zramswap
+  configure_swapfile
+  configure_sysctl
+  summary
+  log "Configuración completada correctamente."
+}
 
-  if [ "$FREE_DISK" -lt "$SWAP_MB" ]; then
-    echo "ERROR: No hay espacio suficiente para crear swapfile"
-    exit 1
-  fi
-
-  if [ ! -f /swapfile ]; then
-
-    echo
-    echo "Creando swapfile..."
-
-    fallocate -l ${SWAP_MB}M /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon -p 10 /swapfile
-
-    grep -q "/swapfile" /etc/fstab || \
-    echo "/swapfile none swap sw 0 0" >> /etc/fstab
-
-  fi
-fi
-
-echo
-echo "Configurando swappiness..."
-
-if grep -q "^vm.swappiness" /etc/sysctl.conf; then
-  sed -i "s/^vm.swappiness=.*/vm.swappiness=10/" /etc/sysctl.conf
-else
-  echo "vm.swappiness=10" >> /etc/sysctl.conf
-fi
-
-echo "vm.dirty_ratio=10" >> /etc/sysctl.conf
-echo "vm.dirty_background_ratio=5" >> /etc/sysctl.conf
-
-sysctl -p >/dev/null
-
-echo
-echo "Calculando memoria efectiva equivalente..."
-
-ZRAM_EFFECTIVE=$((ZRAM_MB*2))
-SWAP_EFFECTIVE=$((SWAP_MB/4))
-RAM_EFFECTIVE=$((RAM_MB+ZRAM_EFFECTIVE+SWAP_EFFECTIVE))
-
-echo
-echo "===== RESUMEN FINAL ====="
-echo "RAM fisica:        ${RAM_MB} MB"
-echo "ZRAM configurado:  ${ZRAM_MB} MB"
-echo "Swap configurado:  ${SWAP_MB} MB"
-echo "RAM equivalente:   ${RAM_EFFECTIVE} MB (~$((RAM_EFFECTIVE/1024)) GB)"
-
-echo
-echo "Estado actual swap:"
-swapon --show
-
-echo
-echo "Estado memoria:"
-free -h
-
-echo
-echo "Log guardado en: $LOG"
-
-echo
-echo "Configuracion completada correctamente"
-
-'
+main "$@"
